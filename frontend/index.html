@@ -1,0 +1,426 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Chấm Thi</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Be+Vietnam+Pro:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+    <script>
+        // áp dụng theme đã chọn trước khi trang hiện ra (tránh nháy màu)
+        try {
+            var savedTheme = localStorage.getItem("quizTheme");
+            if (savedTheme) document.documentElement.dataset.theme = savedTheme;
+        } catch (e) {}
+    </script>
+</head>
+<body>
+
+<header class="topbar">
+    <div class="brand">
+        <div class="logo">C</div>
+        <div>
+            <h2>Chấm Thi</h2>
+            <small>Hệ thống chấm trắc nghiệm</small>
+        </div>
+    </div>
+    <div class="topbar-right">
+        <div class="theme-picker">
+            <label for="themeSelect">Giao diện</label>
+            <select id="themeSelect">
+                <option value="sang-xanh">Sáng</option>
+                <option value="toi-xanh">Tối</option>
+                <option value="nuoc-la">Neon</option>
+            </select>
+        </div>
+        <span class="system-status">Đang hoạt động</span>
+    </div>
+</header>
+
+<div class="layout">
+    <aside class="sidebar">
+        <div class="nav-title">DANH MỤC</div>
+        <button class="nav active" data-page="dashboard">Tổng quan</button>
+        <button class="nav" data-page="exams">Kỳ thi</button>
+        <button class="nav" data-page="answers">Đáp án</button>
+        <button class="nav" data-page="grading">Chấm bài</button>
+        <button class="nav" data-page="results">Kết quả</button>
+
+        <div class="sidebar-bottom">
+            <small>Phiên bản 1.0 <br> Creative Commons </br> BY-NC-ND 4.0 </br> bởi Anh Quốc </br> </small>
+        </div>
+    </aside>
+
+    <main class="main">
+        <div id="expiryBanner" class="expiry-banner" hidden></div>
+
+        <!-- DASHBOARD -->
+        <section id="dashboard" class="page active">
+            <div class="page-heading">
+                <div>
+                    <h1>Tổng quan</h1>
+                    <p>Quản lý và chấm bài trắc nghiệm.</p>
+                </div>
+            </div>
+
+            <div class="stats">
+                <div class="stat-card">
+                    <span>Kỳ thi</span>
+                    <strong id="examCount">0</strong>
+                </div>
+                <div class="stat-card">
+                    <span>Bài làm</span>
+                    <strong id="submissionCount">0</strong>
+                </div>
+                <div class="stat-card">
+                    <span>Đã chấm</span>
+                    <strong id="gradedCount">0</strong>
+                </div>
+            </div>
+
+            <div class="panel">
+                <h3>Thao tác nhanh</h3>
+                <div class="quick-actions">
+                    <button class="primary" onclick="showPage('exams')">Tạo kỳ thi</button>
+                    <button onclick="showPage('answers')">Tạo đáp án</button>
+                    <button onclick="showPage('grading')">Chấm bài</button>
+                </div>
+            </div>
+        </section>
+
+        <!-- EXAMS -->
+        <section id="exams" class="page">
+            <div class="page-heading">
+                <div>
+                    <h1>Kỳ thi</h1>
+                    <p>Tạo và quản lý các kỳ thi.</p>
+                </div>
+            </div>
+
+            <div class="panel">
+                <h3>Tạo kỳ thi</h3>
+                <form id="examForm">
+                    <label for="examName">Tên kỳ thi</label>
+                    <input id="examName" required placeholder="Ví dụ: Thi Học kỳ 1">
+
+                    <label for="examDescription">Mô tả</label>
+                    <textarea id="examDescription" rows="3" placeholder="Thông tin kỳ thi"></textarea>
+
+                    <button type="submit" class="primary">Lưu kỳ thi</button>
+                </form>
+            </div>
+
+            <div class="panel">
+                <h3>Danh sách kỳ thi</h3>
+                <div id="examList"></div>
+            </div>
+        </section>
+
+        <!-- ANSWERS -->
+        <section id="answers" class="page">
+            <div class="page-heading">
+                <div>
+                    <h1>Đáp án</h1>
+                    <p>Nhập đáp án chuẩn hoặc tải từ tài liệu.</p>
+                </div>
+            </div>
+
+            <div class="panel">
+                <h3>Tạo mã đề</h3>
+
+                <label for="answerExam">Kỳ thi</label>
+                <select id="answerExam"></select>
+
+                <div class="form-row">
+                    <div>
+                        <label for="paperCode">Mã đề</label>
+                        <input id="paperCode" placeholder="Ví dụ: 101">
+                    </div>
+                    <div>
+                        <label for="paperTitle">Tên đề thi</label>
+                        <input id="paperTitle" placeholder="Ví dụ: Toán 12">
+                    </div>
+                </div>
+
+                <button id="createPaper" class="primary">Tạo mã đề</button>
+
+                <p id="paperStatus" class="message"></p>
+            </div>
+
+            <div class="panel">
+                <h3>Chọn mã đề đang thao tác</h3>
+            
+                <label for="questionPaper">Mã đề</label>
+                <select id="questionPaper"></select>
+            </div>
+
+            <div class="panel">
+                <h3>Nhập đáp án</h3>
+
+                <div class="form-row">
+                    <div>
+                        <label for="bulkCountMCQ">Số câu Phần I (A/B/C/D)</label>
+                        <input id="bulkCountMCQ" type="number" min="0" value="0">
+                    </div>
+                    <div>
+                        <label for="bulkCountTF">Số câu Phần II (Đúng/Sai)</label>
+                        <input id="bulkCountTF" type="number" min="0" value="0">
+                    </div>
+                </div>
+
+                <div class="form-row">
+                    <div>
+                        <label for="bulkPointsMCQ">Điểm mỗi câu Phần I</label>
+                        <input id="bulkPointsMCQ" type="number" min="0" step="0.01" value="0.25">
+                    </div>
+                    <div>
+                        <label for="bulkPointsTF">Điểm mỗi câu Phần II</label>
+                        <input id="bulkPointsTF" type="number" min="0" step="0.01" value="1">
+                    </div>
+                </div>
+
+                <button id="buildBulkGrid" type="button">Tạo khung nhập</button>
+
+                <div id="bulkFormArea" hidden>
+
+                    <div id="bulkMCQSection" hidden>
+                        <h4 class="bulk-heading">Phần I - Trắc nghiệm A/B/C/D</h4>
+
+                        <textarea id="bulkQuickPaste" rows="2" placeholder="Ví dụ: 1A 2B 3C 4D 5A 6B ..."></textarea>
+                        <button id="applyQuickPaste" type="button">Tự động điền từ văn bản (chỉ Phần I)</button>
+
+                        <div class="bulk-grid" id="bulkMCQGrid"></div>
+                    </div>
+
+                    <div id="bulkTFSection" hidden>
+                        <h4 class="bulk-heading">Phần II - Đúng/Sai (mỗi câu 1 đáp án)</h4>
+                        <div class="bulk-grid" id="bulkTFGrid"></div>
+                    </div>
+
+                    <button id="saveBulkAnswers" class="primary">Lưu tất cả đáp án</button>
+                    <p id="bulkStatus" class="message"></p>
+                </div>
+            </div>
+
+            <div class="panel">
+                <h3>Đọc đáp án từ Word / Excel / PDF</h3>
+
+                <label for="documentFile">Chọn tài liệu (.docx, .xlsx, .pdf)</label>
+                <input id="documentFile" type="file" accept=".docx,.xlsx,.pdf">
+
+                <button id="parseDocument">Đọc & nhận dạng đáp án</button>
+
+                <p id="parseDocumentStatus" class="message"></p>
+
+                <div id="parseResultArea" hidden>
+                    <p class="muted" id="parseResultSummary"></p>
+                    <ul id="parseWarningsList" class="warning-list"></ul>
+
+                    <button id="applyParsedAnswers" class="primary" type="button">
+                        Đổ vào khung nhập để kiểm tra
+                    </button>
+
+                    <details class="raw-preview-details">
+                        <summary>Xem văn bản/bảng gốc đã trích xuất (để đối chiếu nếu đọc sai)</summary>
+                        <textarea id="documentContent" rows="8" readonly></textarea>
+                    </details>
+                </div>
+            </div>
+
+            <div class="panel">
+                <h3>Xem lại đáp án đã lưu</h3>
+
+
+                <button id="loadSavedAnswers" type="button">Xem danh sách đáp án đã lưu</button>
+
+                <div id="savedAnswersArea"></div>
+            </div>
+        </section>
+
+        <!-- GRADING -->
+        <section id="grading" class="page">
+            <div class="page-heading">
+                <div>
+                    <h1>Chấm bài</h1>
+                    <p>Quét phiếu bằng camera để chấm điểm ngay lập tức.</p>
+                </div>
+            </div>
+
+            <div class="panel scan-panel">
+                <h3>Quét nhanh bằng Camera</h3>
+
+
+                <label for="scanExam">Kỳ thi</label>
+                <select id="scanExam"></select>
+
+                <label for="scanPaper">Mã đề</label>
+                <select id="scanPaper"></select>
+                <small class="hint">
+                    Để trống ("Tự động nhận Mã đề") nếu muốn quét lẫn lộn nhiều mã đề khác nhau —
+                    hệ thống sẽ tự đọc ô Mã đề trên phiếu.
+                </small>
+
+                <div class="camera-box">
+                    <video id="scanVideo" playsinline autoplay muted hidden></video>
+                    <canvas id="scanCanvas" hidden></canvas>
+
+                    <div id="scanGuide" class="scan-guide" hidden>
+                        <i class="guide-sq tl"></i>
+                        <i class="guide-sq tr"></i>
+                        <i class="guide-sq bl"></i>
+                        <i class="guide-sq br"></i>
+                        <i class="guide-sq ml"></i>
+                        <i class="guide-sq mr"></i>
+                    </div>
+
+                    <div id="scanFlash" class="scan-flash" hidden>
+                        <div id="flashScore" class="flash-score"></div>
+                        <div id="flashInfo" class="flash-info"></div>
+                    </div>
+
+                    <div id="scanOverlayHint" class="camera-hint" hidden>
+                        Đặt 4 ô đen ở góc phiếu vào 4 ô vuông trên màn hình, giữ yên tay
+                    </div>
+                </div>
+
+                <div class="action-group">
+                    <button id="startScan" class="primary">Bật camera</button>
+                    <button id="captureNow" hidden>Chụp ngay</button>
+                    <button id="nextScan" hidden>Chấm bài tiếp</button>
+                    <button id="stopScan" hidden>Tắt camera</button>
+                </div>
+
+                <p id="scanStatus" class="message"></p>
+
+                <div id="scanResult" class="scan-result" hidden>
+                    <div class="result-stats">
+                        <div class="result-box">
+                            Điểm
+                            <strong id="scanScore">-</strong>
+                        </div>
+                        <div class="result-box">
+                            Đúng
+                            <strong id="scanCorrect">-</strong>
+                        </div>
+                        <div class="result-box">
+                            Sai
+                            <strong id="scanIncorrect">-</strong>
+                        </div>
+                        <div class="result-box">
+                            Chưa rõ
+                            <strong id="scanAmbiguous">-</strong>
+                        </div>
+                    </div>
+
+                    <p class="muted" id="scanDetected"></p>
+
+                    <label for="scanSbdEdit">Số báo danh (sửa nếu đọc sai, bấm Lưu SBD)</label>
+                    <div class="action-group">
+                        <input id="scanSbdEdit" placeholder="Số báo danh" style="flex:1;min-width:200px">
+                        <button id="saveScanSbd" type="button">Lưu SBD</button>
+                    </div>
+
+                    <div class="legend">
+                        <span><i class="dot dot-green"></i> Đúng</span>
+                        <span><i class="dot dot-red"></i> Sai</span>
+                        <span><i class="dot dot-yellow"></i> Mờ / tô nhiều ô, cần xem lại</span>
+                    </div>
+
+                    <img id="annotatedImage" class="image-preview" alt="Ảnh bài thi đã chấm">
+                </div>
+
+                <div id="scanHistoryBox" hidden>
+                    <h3 style="margin-top:32px">Các bài đã chấm trong phiên này</h3>
+                    <table class="result-table" id="scanHistoryTable"></table>
+                </div>
+            </div>
+
+            <div class="panel">
+                <h3>Nhập thủ công bài thi</h3>
+
+                <label for="gradingPaper">Mã đề</label>
+                <select id="gradingPaper"></select>
+
+                <label class="upload-area" for="answerImage">
+                    <strong>Chọn ảnh phiếu trả lời</strong>
+                    <small>Định dạng JPG, JPEG, PNG, WEBP</small>
+                </label>
+
+                <input id="answerImage" type="file" accept="image/*" capture="environment" hidden>
+
+                <img id="imagePreview" class="image-preview" hidden>
+
+                <button id="uploadImage" class="primary">Đọc và chấm điểm</button>
+
+                <p id="uploadStatus" class="message"></p>
+                <input id="submissionId" type="hidden">
+            </div>
+
+            <div class="panel" id="manualConfirmPanel" hidden>
+                <h3>Xác nhận và chấm điểm</h3>
+
+                <p class="muted">
+                    Kiểm tra lại đáp án bên dưới, bấm Xác nhận đáp án trước khi bấm Chấm điểm.
+                </p>
+
+                <div class="answer-grid" id="studentAnswerGrid"></div>
+
+                <div class="action-group">
+                    <button id="saveStudentAnswers">Xác nhận đáp án</button>
+                    <button id="gradeButton" class="primary">Chấm điểm</button>
+                </div>
+
+                <p id="gradeStatus" class="message"></p>
+            </div>
+        </section>
+
+        <!-- RESULTS -->
+        <section id="results" class="page">
+            <div class="page-heading">
+                <div>
+                    <h1>Kết quả</h1>
+                    <p>Tra cứu và xuất kết quả.</p>
+                </div>
+            </div>
+
+            <div class="panel">
+                <h3>Danh sách điểm cả kỳ thi</h3>
+
+                <label for="resultExam">Kỳ thi</label>
+                <select id="resultExam"></select>
+
+                <label for="resultPaper">Mã đề</label>
+                <select id="resultPaper"></select>
+
+                <div class="action-group">
+                    <button id="loadExamResults" type="button">Xem danh sách</button>
+                    <button id="exportExamResults" type="button" class="primary">Xuất Excel tất cả bài</button>
+                </div>
+
+                <div id="examResultsTable"></div>
+            </div>
+
+            <div class="panel">
+                <h3>Tra cứu</h3>
+                <label for="resultId">Mã bài làm</label>
+                <input id="resultId" placeholder="Nhập mã bài, ví dụ B00012">
+
+                <div class="action-group">
+                    <button id="loadResult" class="primary">Xem kết quả</button>
+                    <button id="exportResult">Xuất Excel</button>
+                </div>
+
+                <div id="resultContent"></div>
+            </div>
+        </section>
+
+    </main>
+</div>
+
+<div id="toast" class="toast"></div>
+
+<script src="app.js"></script>
+</body>
+</html>
