@@ -132,8 +132,16 @@ function asyncRoute(handler) {
 // 1. KIỂM TRA API VÀ DATABASE
 // ======================================================
 
+// Render gọi đường dẫn này liên tục để kiểm tra dịch vụ còn sống.
+// KHÔNG truy vấn database ở đây: nếu database chập chờn một lúc thì Render
+// sẽ tưởng cả web bị treo và khởi động lại nó một cách không cần thiết.
+app.get("/api/health", (req, res) => {
+    res.json({ status: "ok" });
+});
+
+// Dùng khi muốn kiểm tra riêng kết nối database
 app.get(
-    "/api/health",
+    "/api/health/db",
     asyncRoute(async (req, res) => {
         await db.query("SELECT 1");
 
