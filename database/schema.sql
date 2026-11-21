@@ -127,30 +127,57 @@ ALTER TABLE exams
 
 UPDATE exams SET expires_at = NOW() + INTERVAL '7 days' WHERE expires_at IS NULL;
 
--- Mã ngắn, dễ nhớ: kỳ thi KT001.., bài làm B00001..
-CREATE SEQUENCE IF NOT EXISTS exam_code_seq;
-CREATE SEQUENCE IF NOT EXISTS submission_code_seq;
-
-CREATE OR REPLACE FUNCTION make_code(prefix text, n bigint, width int)
-RETURNS text AS $$
-    SELECT prefix || CASE
-        WHEN length(n::text) >= width THEN n::text
-        ELSE lpad(n::text, width, '0')
-    END
-$$ LANGUAGE sql IMMUTABLE;
-
+-- Mã 8 ký tự ngẫu nhiên, dễ nhớ: kỳ thi KT + 6 số, bài làm BL + 6 số
 ALTER TABLE exams ADD COLUMN IF NOT EXISTS code VARCHAR(12);
 ALTER TABLE submissions ADD COLUMN IF NOT EXISTS code VARCHAR(12);
 
-UPDATE exams e SET code = make_code('KT', nextval('exam_code_seq'), 3)
-FROM (SELECT id FROM exams WHERE code IS NULL ORDER BY created_at) x WHERE e.id = x.id;
+CREATE OR REPLACE FUNCTION random_unique_code(prefix text, tbl text)
+RETURNS text AS $$
+DECLARE
+    c text;
+    taken boolean;
+BEGIN
+    LOOP
+        c := prefix || (100000 + floor(random() * 900000))::int::text;
 
-UPDATE submissions s SET code = make_code('B', nextval('submission_code_seq'), 5)
-FROM (SELECT id FROM submissions WHERE code IS NULL ORDER BY COALESCE(scanned_at, created_at)) x
-WHERE s.id = x.id;
+        EXECUTE format('SELECT EXISTS (SELECT 1 FROM %I WHERE code = $1)', tbl)
+            INTO taken USING c;
 
-ALTER TABLE exams ALTER COLUMN code SET DEFAULT make_code('KT', nextval('exam_code_seq'), 3);
-ALTER TABLE submissions ALTER COLUMN code SET DEFAULT make_code('B', nextval('submission_code_seq'), 5);
+        EXIT WHEN NOT taken;
+    END LOOP;
+
+    RETURN c;
+END
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION set_exam_code() RETURNS trigger AS $$
+BEGIN
+    IF NEW.code IS NULL THEN
+        NEW.code := random_unique_code('KT', 'exams');
+    END IF;
+    RETURN NEW;
+END
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION set_submission_code() RETURNS trigger AS $$
+BEGIN
+    IF NEW.code IS NULL THEN
+        NEW.code := random_unique_code('BL', 'submissions');
+    END IF;
+    RETURN NEW;
+END
+$$ LANGUAGE plpgsql;
+
+ALTER TABLE exams ALTER COLUMN code DROP DEFAULT;
+ALTER TABLE submissions ALTER COLUMN code DROP DEFAULT;
+
+DROP TRIGGER IF EXISTS trg_exam_code ON exams;
+CREATE TRIGGER trg_exam_code BEFORE INSERT ON exams
+    FOR EACH ROW EXECUTE PROCEDURE set_exam_code();
+
+DROP TRIGGER IF EXISTS trg_submission_code ON submissions;
+CREATE TRIGGER trg_submission_code BEFORE INSERT ON submissions
+    FOR EACH ROW EXECUTE PROCEDURE set_submission_code();
 
 CREATE UNIQUE INDEX IF NOT EXISTS ux_exams_code ON exams(code);
 CREATE UNIQUE INDEX IF NOT EXISTS ux_submissions_code ON submissions(code);

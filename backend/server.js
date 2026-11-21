@@ -33,15 +33,15 @@ app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 
 // Cho phép dùng MÃ NGẮN thay cho UUID ở mọi đường dẫn có :id
-//   KT001 -> kỳ thi,  B00012 -> bài làm  (không phân biệt hoa/thường)
+//   KT483921 -> kỳ thi,  BL274058 -> bài làm  (không phân biệt hoa/thường)
 app.param("id", async (req, res, next, value) => {
     try {
         const code = String(value).trim().toUpperCase();
 
         let table = null;
 
-        if (/^KT\d+$/.test(code)) table = "exams";
-        else if (/^B\d+$/.test(code)) table = "submissions";
+        if (/^KT\d{6}$/.test(code)) table = "exams";
+        else if (/^BL\d{6}$/.test(code)) table = "submissions";
 
         if (!table) return next();
 
@@ -2203,47 +2203,103 @@ async function ensureOmrMigration() {
             ADD COLUMN IF NOT EXISTS image_data BYTEA,
             ADD COLUMN IF NOT EXISTS annotated_image_data BYTEA
     `);
-    // Mã ngắn, dễ nhớ cho người dùng: kỳ thi KT001, KT002...; bài làm B00001...
-    await db.query("CREATE SEQUENCE IF NOT EXISTS exam_code_seq");
-    await db.query("CREATE SEQUENCE IF NOT EXISTS submission_code_seq");
-    await db.query(`
-        CREATE OR REPLACE FUNCTION make_code(prefix text, n bigint, width int)
-        RETURNS text AS $$
-            SELECT prefix || CASE
-                WHEN length(n::text) >= width THEN n::text
-                ELSE lpad(n::text, width, '0')
-            END
-        $$ LANGUAGE sql IMMUTABLE
-    `);
+    // Mã 8 ký tự, ngẫu nhiên, dễ nhớ (2 chữ cái + 6 chữ số):
+    //   kỳ thi  : KT + 6 số   (vd KT483921)
+    //   bài làm : BL + 6 số   (vd BL274058)
+    // Mã được chọn ngẫu nhiên và kiểm tra trùng, KHÔNG phụ thuộc bộ đếm,
+    // nên xóa kỳ thi rồi tạo mới sẽ không còn "nhớ" số cũ.
     await db.query("ALTER TABLE exams ADD COLUMN IF NOT EXISTS code VARCHAR(12)");
     await db.query("ALTER TABLE submissions ADD COLUMN IF NOT EXISTS code VARCHAR(12)");
 
-    // Cấp mã cho dữ liệu đã có (theo thứ tự thời gian)
     await db.query(`
-        UPDATE exams e
-        SET code = make_code('KT', nextval('exam_code_seq'), 3)
-        FROM (SELECT id FROM exams WHERE code IS NULL ORDER BY created_at) x
-        WHERE e.id = x.id
-    `);
-    await db.query(`
-        UPDATE submissions s
-        SET code = make_code('B', nextval('submission_code_seq'), 5)
-        FROM (
-            SELECT id FROM submissions WHERE code IS NULL
-            ORDER BY COALESCE(scanned_at, created_at)
-        ) x
-        WHERE s.id = x.id
+        CREATE OR REPLACE FUNCTION random_unique_code(prefix text, tbl text)
+        RETURNS text AS $$
+        DECLARE
+            c text;
+            taken boolean;
+        BEGIN
+            LOOP
+                c := prefix || (100000 + floor(random() * 900000))::int::text;
+
+                EXECUTE format('SELECT EXISTS (SELECT 1 FROM %I WHERE code = $1)', tbl)
+                    INTO taken USING c;
+
+                EXIT WHEN NOT taken;
+            END LOOP;
+
+            RETURN c;
+        END
+        $$ LANGUAGE plpgsql
     `);
 
-    // Dữ liệu mới tự có mã
     await db.query(`
-        ALTER TABLE exams ALTER COLUMN code
-        SET DEFAULT make_code('KT', nextval('exam_code_seq'), 3)
+        CREATE OR REPLACE FUNCTION set_exam_code() RETURNS trigger AS $$
+        BEGIN
+            IF NEW.code IS NULL THEN
+                NEW.code := random_unique_code('KT', 'exams');
+            END IF;
+            RETURN NEW;
+        END
+        $$ LANGUAGE plpgsql
     `);
     await db.query(`
-        ALTER TABLE submissions ALTER COLUMN code
-        SET DEFAULT make_code('B', nextval('submission_code_seq'), 5)
+        CREATE OR REPLACE FUNCTION set_submission_code() RETURNS trigger AS $$
+        BEGIN
+            IF NEW.code IS NULL THEN
+                NEW.code := random_unique_code('BL', 'submissions');
+            END IF;
+            RETURN NEW;
+        END
+        $$ LANGUAGE plpgsql
     `);
+
+    // bỏ cách đánh số tăng dần cũ, dùng trigger tạo mã ngẫu nhiên
+    await db.query("ALTER TABLE exams ALTER COLUMN code DROP DEFAULT");
+    await db.query("ALTER TABLE submissions ALTER COLUMN code DROP DEFAULT");
+
+    await db.query("DROP TRIGGER IF EXISTS trg_exam_code ON exams");
+    await db.query(`
+        CREATE TRIGGER trg_exam_code BEFORE INSERT ON exams
+        FOR EACH ROW EXECUTE PROCEDURE set_exam_code()
+    `);
+    await db.query("DROP TRIGGER IF EXISTS trg_submission_code ON submissions");
+    await db.query(`
+        CREATE TRIGGER trg_submission_code BEFORE INSERT ON submissions
+        FOR EACH ROW EXECUTE PROCEDURE set_submission_code()
+    `);
+
+    // Đổi mã cũ (dạng KT001 / B00001) sang định dạng mới 8 ký tự
+    const { randomInt } = require("crypto");
+
+    async function recode(table, prefix) {
+        const rows = await db.query(
+            `SELECT id FROM ${table} WHERE code IS NULL OR code !~ $1`,
+            [`^${prefix}[0-9]{6}$`]
+        );
+
+        for (const row of rows.rows) {
+            for (let attempt = 0; attempt < 30; attempt++) {
+                const code = prefix + randomInt(100000, 1000000);
+
+                try {
+                    await db.query(
+                        `UPDATE ${table} SET code = $1 WHERE id = $2`,
+                        [code, row.id]
+                    );
+                    break;
+                } catch (error) {
+                    if (error.code !== "23505") throw error; // chỉ thử lại khi trùng mã
+                }
+            }
+        }
+    }
+
+    await db.query("DROP INDEX IF EXISTS ux_exams_code");
+    await db.query("DROP INDEX IF EXISTS ux_submissions_code");
+
+    await recode("exams", "KT");
+    await recode("submissions", "BL");
+
     await db.query("CREATE UNIQUE INDEX IF NOT EXISTS ux_exams_code ON exams(code)");
     await db.query("CREATE UNIQUE INDEX IF NOT EXISTS ux_submissions_code ON submissions(code)");
 
