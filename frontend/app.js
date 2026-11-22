@@ -922,7 +922,7 @@ document.getElementById("answerImage").addEventListener(
     }
 );
 
-// UPLOAD IMAGE -> TỰ ĐỘNG ĐỌC + CHẤM (OMR)
+// TẢI ẢNH LÊN -> ĐỌC VÀ CHẤM NGAY TRÊN MÁY (không gửi ảnh lên server để xử lý)
 document.getElementById("uploadImage").addEventListener(
     "click",
     async () => {
@@ -942,41 +942,21 @@ document.getElementById("uploadImage").addEventListener(
             return;
         }
 
-        const form = new FormData();
-
-        form.append("file", file);
-
-        if (paperId) form.append("paper_id", paperId);
-        else form.append("exam_id", examId);
-
         btn.disabled = true;
-        statusEl.textContent = "Đang đọc phiếu và chấm điểm...";
 
         try {
-            const response = await fetch(`${API}/submissions/scan`, {
-                method: "POST",
-                body: form
+            const { imageData, originalBlob } = await captureFromFile(file);
+
+            const data = await scanOnDevice({
+                imageData,
+                originalBlob,
+                examId,
+                paperId,
+                statusEl
             });
 
-            const data = await response.json().catch(() => ({}));
-
-            if (!response.ok) {
-                let message = data.error || "Không đọc được phiếu, thử ảnh khác";
-
-                if (data.detail) message += ": " + data.detail;
-
-                if (data.detected_paper_code) {
-                    message += ` (đọc được mã đề: ${data.detected_paper_code})`;
-                }
-
-                statusEl.textContent = message;
-                toast(message);
-                return;
-            }
-
-            statusEl.textContent = "Đã đọc và chấm xong. Mã bài: " + (data.submission_code || data.submission_id);
-
-            showScanResult(data);
+            statusEl.textContent =
+                "Đã đọc và chấm xong. Mã bài: " + (data.submission_code || data.submission_id);
 
             scanResultEl.scrollIntoView({ behavior: "smooth", block: "start" });
 
@@ -1816,16 +1796,279 @@ async function checkFrameForAutoCapture() {
     }
 }
 
-function captureFullFrameBlob() {
-    scanCanvas.width = scanVideo.videoWidth;
-    scanCanvas.height = scanVideo.videoHeight;
+// ======================================================
+// ĐỌC PHIẾU NGAY TRÊN MÁY NGƯỜI DÙNG (điện thoại / trình duyệt)
+// Ảnh không cần gửi lên server: trình duyệt tự nhận diện phiếu, đọc SBD, mã
+// đề, đáp án; server chỉ nhận kết quả đọc để chấm theo đáp án rồi lưu.
+// ======================================================
+const OMR_MAX_SIDE = 2000;
 
-    const ctx = scanCanvas.getContext("2d");
-    ctx.drawImage(scanVideo, 0, 0, scanCanvas.width, scanCanvas.height);
+let omrWorker = null;
+let omrJobId = 0;
+const omrPending = new Map();
 
-    return new Promise(resolve => {
-        scanCanvas.toBlob(resolve, "image/jpeg", 0.92);
+function getOmrWorker() {
+    if (omrWorker) return omrWorker;
+
+    try {
+        omrWorker = new Worker("omr/omr-worker.js");
+
+        omrWorker.onmessage = event => {
+            const job = omrPending.get(event.data.id);
+
+            if (!job) return;
+
+            omrPending.delete(event.data.id);
+
+            if (event.data.error) job.reject(new Error(event.data.error));
+            else job.resolve(event.data.result);
+        };
+
+        omrWorker.onerror = () => {
+            // worker lỗi: chuyển sang xử lý trực tiếp trên luồng chính
+            for (const job of omrPending.values()) {
+                const failure = new Error("Worker lỗi");
+
+                failure.workerFailed = true;
+                job.reject(failure);
+            }
+
+            omrPending.clear();
+            omrWorker = null;
+        };
+    } catch (error) {
+        omrWorker = null;
+    }
+
+    return omrWorker;
+}
+
+function runOmr(imageData) {
+    const worker = getOmrWorker();
+
+    // Không có / không tải được worker: xử lý ngay trên luồng chính
+    const runInline = () => Promise.resolve().then(() => window.OMR.processImage(imageData));
+
+    if (!worker) return runInline();
+
+    return new Promise((resolve, reject) => {
+        const id = ++omrJobId;
+
+        omrPending.set(id, { resolve, reject });
+
+        // gửi BẢN SAO sang worker để còn dữ liệu gốc dùng cho phương án dự phòng
+        const copy = imageData.data.buffer.slice(0);
+
+        worker.postMessage(
+            { id, width: imageData.width, height: imageData.height, buffer: copy },
+            [copy]
+        );
+    }).catch(error => {
+        if (error && error.workerFailed) return runInline();
+
+        throw error;
     });
+}
+
+function canvasToJpegBlob(canvas, quality) {
+    return new Promise(resolve => canvas.toBlob(resolve, "image/jpeg", quality));
+}
+
+// Vẽ nguồn (video / ảnh) vào canvas RIÊNG của lần này (không dùng chung, để
+// hai thao tác chồng nhau không ghi đè lên ảnh của nhau), thu nhỏ nếu quá lớn
+function drawToWorkCanvas(source, sourceWidth, sourceHeight) {
+    const scale = Math.min(1, OMR_MAX_SIDE / Math.max(sourceWidth, sourceHeight));
+    const width = Math.round(sourceWidth * scale);
+    const height = Math.round(sourceHeight * scale);
+
+    const canvas = document.createElement("canvas");
+
+    canvas.width = width;
+    canvas.height = height;
+
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
+
+    ctx.drawImage(source, 0, 0, width, height);
+
+    return { canvas, ctx, width, height };
+}
+
+async function captureFromVideo() {
+    const { canvas, ctx, width, height } = drawToWorkCanvas(
+        scanVideo,
+        scanVideo.videoWidth,
+        scanVideo.videoHeight
+    );
+
+    const imageData = ctx.getImageData(0, 0, width, height);
+    const originalBlob = await canvasToJpegBlob(canvas, 0.8);
+
+    return { imageData, originalBlob };
+}
+
+async function captureFromFile(file) {
+    let bitmap;
+
+    try {
+        bitmap = await createImageBitmap(file, { imageOrientation: "from-image" });
+    } catch (error) {
+        bitmap = await createImageBitmap(file);
+    }
+
+    const { canvas, ctx, width, height } = drawToWorkCanvas(bitmap, bitmap.width, bitmap.height);
+
+    if (bitmap.close) bitmap.close();
+
+    const imageData = ctx.getImageData(0, 0, width, height);
+    const originalBlob = await canvasToJpegBlob(canvas, 0.8);
+
+    return { imageData, originalBlob };
+}
+
+function omrFailureMessage(omr) {
+    if (omr.reason === "no_markers") {
+        return "Không thấy các ô vuông đen của phiếu trong ảnh. Đưa cả tờ phiếu " +
+            "vào khung, đủ sáng, rồi chụp lại.";
+    }
+
+    return `Ảnh chưa đủ chuẩn để đọc chính xác (khớp ${omr.passed}/${omr.total} ô đối chứng, ` +
+        `cần ít nhất ${window.OMR.MIN_PASSED}). Hãy chụp lại: để phiếu phẳng, thấy đủ 4 ô đen ` +
+        "ở góc và 2 ô đen giữa hai mép, không bị bóng đổ hay chói sáng, không chụp quá xa.";
+}
+
+// Vẽ vòng màu lên ảnh phiếu đã nắn phẳng (xanh: đúng, đỏ: sai, vàng: chưa rõ)
+async function buildAnnotatedBlob(omr, details) {
+    const warped = omr.warped;
+    const canvas = document.createElement("canvas");
+
+    canvas.width = warped.w;
+    canvas.height = warped.h;
+
+    const ctx = canvas.getContext("2d");
+    const image = ctx.createImageData(warped.w, warped.h);
+
+    for (let i = 0; i < warped.gray.length; i++) {
+        const v = warped.gray[i];
+
+        image.data[i * 4] = v;
+        image.data[i * 4 + 1] = v;
+        image.data[i * 4 + 2] = v;
+        image.data[i * 4 + 3] = 255;
+    }
+
+    ctx.putImageData(image, 0, 0);
+    ctx.lineWidth = 3;
+
+    const COLORS = {
+        correct: "#22c55e",
+        incorrect: "#dc2626",
+        faint: "#eab308",
+        multiple: "#eab308"
+    };
+
+    const radius = window.OMR.RADIUS + 5;
+    const readByNo = new Map(omr.questions.map(q => [q.question_no, q]));
+
+    const circle = (bubble, color) => {
+        ctx.strokeStyle = color;
+        ctx.beginPath();
+        ctx.arc(bubble.x, bubble.y, radius, 0, Math.PI * 2);
+        ctx.stroke();
+    };
+
+    for (const detail of details) {
+        const bubbles = window.OMR.TEMPLATE.questionBubbles.get(detail.question_no);
+        const read = readByNo.get(detail.question_no);
+
+        if (!bubbles || !read) continue;
+
+        if (detail.mark_status === "multiple") {
+            bubbles.forEach((bubble, i) => {
+                if ((read.scores[i] ?? 0) >= 0.12) circle(bubble, COLORS.multiple);
+            });
+
+            continue;
+        }
+
+        const chosen = read.choice ? bubbles.find(b => b.choice === read.choice) : null;
+        const color = COLORS[detail.mark_status];
+
+        if (chosen && color) circle(chosen, color);
+    }
+
+    return canvasToJpegBlob(canvas, 0.88);
+}
+
+async function uploadSubmissionImages(submissionId, annotatedBlob, originalBlob) {
+    const form = new FormData();
+
+    if (annotatedBlob) form.append("annotated", annotatedBlob, "annotated.jpg");
+    if (originalBlob) form.append("original", originalBlob, "original.jpg");
+
+    const response = await fetch(`${API}/submissions/${submissionId}/images`, {
+        method: "POST",
+        body: form
+    });
+
+    if (!response.ok) throw new Error("Không lưu được ảnh bài thi");
+}
+
+/**
+ * Toàn bộ luồng: đọc phiếu trên máy -> gửi kết quả đọc để chấm -> vẽ ảnh chú
+ * thích -> hiện điểm ngay -> gửi ảnh lên lưu ở nền.
+ */
+async function scanOnDevice({ imageData, originalBlob, examId, paperId, statusEl }) {
+    statusEl.textContent = "Đang đọc phiếu...";
+
+    const omr = await runOmr(imageData);
+
+    if (!omr.ok) throw new Error(omrFailureMessage(omr));
+
+    statusEl.textContent = "Đang chấm điểm...";
+
+    const payload = {
+        sbd: omr.sbd,
+        ma_de: omr.maDe,
+        alignment: { passed: omr.passed, total: omr.total },
+        questions: omr.questions.map(q => ({
+            question_no: q.question_no,
+            choice: q.choice,
+            status: q.status
+        }))
+    };
+
+    if (paperId) payload.paper_id = paperId;
+    else payload.exam_id = examId;
+
+    const response = await fetch(`${API}/submissions/scan-result`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+    });
+
+    const data = await response.json().catch(() => ({}));
+
+    if (!response.ok) {
+        let message = data.error || "Không chấm được, thử chụp lại";
+
+        if (data.detected_paper_code) {
+            message += ` (đọc được mã đề: ${data.detected_paper_code})`;
+        }
+
+        throw new Error(message);
+    }
+
+    // hiện ảnh đã chấm ngay (chưa cần chờ lưu lên server)
+    const annotatedBlob = await buildAnnotatedBlob(omr, data.grading.details);
+
+    showScanResult(data);
+
+    document.getElementById("annotatedImage").src = URL.createObjectURL(annotatedBlob);
+
+    uploadSubmissionImages(data.submission_id, annotatedBlob, originalBlob)
+        .catch(error => toast(error.message));
+
+    return data;
 }
 
 function resumeAutoScanLoop() {
@@ -1848,8 +2091,6 @@ async function captureAndSend() {
     }
 
     try {
-        const blob = await captureFullFrameBlob();
-
         const examId = document.getElementById("scanExam").value;
         const paperId = document.getElementById("scanPaper").value;
 
@@ -1859,30 +2100,21 @@ async function captureAndSend() {
             return;
         }
 
-        const form = new FormData();
-        form.append("file", blob, "scan.jpg");
-        form.append("exam_id", examId);
+        const { imageData, originalBlob } = await captureFromVideo();
 
-        if (paperId) form.append("paper_id", paperId);
+        let data;
 
-        scanStatusEl.textContent = "Đang chấm điểm...";
-
-        const response = await fetch(`${API}/submissions/scan`, {
-            method: "POST",
-            body: form
-        });
-
-        const data = await response.json().catch(() => ({}));
-
-        if (!response.ok) {
-            let message = data.error || "Không chấm được, thử chụp lại";
-
-            if (data.detected_paper_code) {
-                message += ` (đọc được mã đề: ${data.detected_paper_code})`;
-            }
-
-            scanStatusEl.textContent = message;
-            toast(message);
+        try {
+            data = await scanOnDevice({
+                imageData,
+                originalBlob,
+                examId,
+                paperId,
+                statusEl: scanStatusEl
+            });
+        } catch (error) {
+            scanStatusEl.textContent = error.message;
+            toast(error.message);
             beep("error");
 
             lastSmallFrame = null;
@@ -1890,7 +2122,6 @@ async function captureAndSend() {
             return;
         }
 
-        showScanResult(data);
         addScanHistory(data);
         showScanFlash(data);
         beep("ok");
@@ -1939,8 +2170,10 @@ function showScanResult(data) {
             ? " (nên kiểm tra lại SBD)"
             : "");
 
-    const img = document.getElementById("annotatedImage");
-    img.src = data.annotated_image_url + "?t=" + Date.now();
+    if (data.annotated_image_url) {
+        document.getElementById("annotatedImage").src =
+            data.annotated_image_url + "?t=" + Date.now();
+    }
 
     document.getElementById("scanSbdEdit").value =
         data.student_code || data.detected.student_code || "";

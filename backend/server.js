@@ -1768,13 +1768,35 @@ app.post(
         const orientation = chooseOrientation(original, detection.markers);
 
         if (!orientation || orientation.passed < MIN_PASSED) {
+            if (orientation) {
+                console.warn(
+                    "Từ chối ảnh: khớp %d/%d ô đối chứng (xoay %d độ), độ tương phản: %s, " +
+                    "ảnh %dx%d, 4 góc tìm được: %s",
+                    orientation.passed,
+                    orientation.total,
+                    orientation.rotation,
+                    JSON.stringify(orientation.contrasts),
+                    original.bitmap.width,
+                    original.bitmap.height,
+                    JSON.stringify(detection.markers)
+                );
+            }
+
             return res.status(422).json({
                 error:
-                    "Ảnh chưa đủ chuẩn để đọc chính xác (phiếu bị nghiêng quá nhiều, " +
-                    "mờ, chụp quá xa, bị che hoặc gấp nếp). Hãy chụp lại: để phiếu " +
-                    "phẳng, thấy rõ toàn bộ phiếu và đủ sáng.",
+                    "Ảnh chưa đủ chuẩn để đọc chính xác" +
+                    (orientation
+                        ? ` (khớp ${orientation.passed}/${orientation.total} ô đối chứng, cần ít nhất ${MIN_PASSED})`
+                        : "") +
+                    ". Hãy chụp lại: để phiếu phẳng, thấy đủ 4 ô đen ở góc và 2 ô đen " +
+                    "giữa hai mép, không bị bóng đổ hay chói sáng, không chụp quá xa.",
                 alignment: orientation
-                    ? { passed: orientation.passed, total: orientation.total }
+                    ? {
+                        passed: orientation.passed,
+                        total: orientation.total,
+                        rotation: orientation.rotation,
+                        contrasts: orientation.contrasts
+                    }
                     : null
             });
         }
@@ -2065,6 +2087,310 @@ app.post(
             grading: result,
             annotated_image_url: `/api/submissions/${submissionId}/annotated-image`
         });
+    })
+);
+
+// ======================================================
+// 17b. OMR XỬ LÝ TRÊN MÁY NGƯỜI DÙNG: nhận KẾT QUẢ ĐỌC, chấm và lưu
+//      (ảnh được xử lý ngay trên điện thoại/trình duyệt, server chỉ chấm
+//       theo đáp án trong database rồi lưu, nên rất nhẹ)
+// ======================================================
+
+const VALID_MARK_STATUS = new Set(["filled", "blank", "multiple", "faint"]);
+
+function cleanReadings(list) {
+    const map = new Map();
+
+    if (!Array.isArray(list) || list.length > 200) return map;
+
+    for (const item of list) {
+        const no = Number(item && item.question_no);
+
+        if (!Number.isInteger(no) || no < 1 || no > 200) continue;
+
+        map.set(no, {
+            choice: ["A", "B", "C", "D"].includes(item.choice) ? item.choice : null,
+            status: VALID_MARK_STATUS.has(item.status) ? item.status : "blank"
+        });
+    }
+
+    return map;
+}
+
+function cleanDigits(field) {
+    const value = String((field && field.value) ?? "").slice(0, 10);
+
+    return {
+        value: /^[0-9?]*$/.test(value) ? value : "",
+        status: VALID_MARK_STATUS.has(field && field.status) ? field.status : "blank"
+    };
+}
+
+app.post(
+    "/api/submissions/scan-result",
+    asyncRoute(async (req, res) => {
+        const body = req.body || {};
+
+        const manualPaperId = body.paper_id || null;
+        const examId = body.exam_id || null;
+
+        if (!manualPaperId && !examId) {
+            return res.status(400).json({
+                error: "Thiếu exam_id (để tự nhận diện Mã đề) hoặc paper_id (nếu đã chọn mã đề thủ công)"
+            });
+        }
+
+        const sbd = cleanDigits(body.sbd);
+        const maDe = cleanDigits(body.ma_de);
+        const readings = cleanReadings(body.questions);
+
+        if (!readings.size) {
+            return res.status(400).json({ error: "Thiếu kết quả đọc đáp án" });
+        }
+
+        let paper = null;
+
+        if (manualPaperId) {
+            const paperResult = await db.query(
+                "SELECT * FROM exam_papers WHERE id = $1",
+                [manualPaperId]
+            );
+
+            if (!paperResult.rowCount) {
+                return res.status(404).json({ error: "Không tìm thấy mã đề đã chọn" });
+            }
+
+            paper = paperResult.rows[0];
+
+        } else {
+            if (maDe.status !== "filled") {
+                return res.status(422).json({
+                    error:
+                        "Không đọc rõ ô Mã đề trên phiếu (tô mờ, tô nhiều ô, " +
+                        "hoặc bỏ trống). Hãy chụp lại hoặc chọn mã đề thủ công.",
+                    detected_paper_code: maDe.value,
+                    paper_code_status: maDe.status
+                });
+            }
+
+            const paperResult = await db.query(
+                "SELECT * FROM exam_papers WHERE exam_id = $1 AND paper_code = $2",
+                [examId, maDe.value]
+            );
+
+            if (!paperResult.rowCount) {
+                return res.status(404).json({
+                    error:
+                        `Đọc được Mã đề "${maDe.value}" nhưng không khớp mã ` +
+                        "đề nào trong kỳ thi này. Kiểm tra lại hoặc chọn mã đề thủ công.",
+                    detected_paper_code: maDe.value
+                });
+            }
+
+            paper = paperResult.rows[0];
+        }
+
+        const paperId = paper.id;
+
+        const questions = await db.query(
+            `
+            SELECT q.id, q.question_no, q.question_type, a.correct_answer, a.points
+            FROM questions q
+            JOIN answer_keys a ON a.question_id = q.id
+            WHERE q.paper_id = $1
+            ORDER BY q.question_no
+            `,
+            [paperId]
+        );
+
+        if (!questions.rowCount) {
+            return res.status(400).json({ error: "Mã đề này chưa có câu hỏi/đáp án nào" });
+        }
+
+        // Chỉ chấm đúng các câu có trong đề; câu không có kết quả đọc = bỏ trống
+        const answers = {};
+        const markStatus = {};
+
+        for (const q of questions.rows) {
+            const read = readings.get(q.question_no);
+
+            answers[q.id] = read ? read.choice : null;
+            markStatus[q.id] = read ? read.status : "blank";
+        }
+
+        const result = gradeExam(questions.rows, answers, markStatus);
+
+        const scannedAt = new Date();
+        const stamp = vnTime(scannedAt);
+
+        const finalStudentCode =
+            sbd.status === "filled" && !sbd.value.includes("?") ? sbd.value : null;
+
+        const client = await db.pool.connect();
+
+        let submissionId;
+        let submissionCode;
+
+        try {
+            await client.query("BEGIN");
+
+            const inserted = await client.query(
+                `
+                INSERT INTO submissions(
+                    paper_id, student_code, exam_code,
+                    detected_student_code, detected_paper_code,
+                    status, source, scanned_at
+                )
+                VALUES ($1,$2,$3,$4,$5,'graded','scan',$6)
+                RETURNING id, code
+                `,
+                [paperId, finalStudentCode, maDe.value, sbd.value, maDe.value, scannedAt]
+            );
+
+            submissionId = inserted.rows[0].id;
+            submissionCode = inserted.rows[0].code;
+
+            for (const detail of result.details) {
+                await client.query(
+                    `
+                    INSERT INTO detected_answers(
+                        submission_id, question_id, student_answer,
+                        confidence, verified, mark_status
+                    )
+                    VALUES ($1,$2,$3,$4,FALSE,$5)
+                    ON CONFLICT(submission_id, question_id)
+                    DO UPDATE SET
+                        student_answer = EXCLUDED.student_answer,
+                        mark_status = EXCLUDED.mark_status
+                    `,
+                    [
+                        submissionId,
+                        detail.question_id,
+                        JSON.stringify(detail.student_answer),
+                        null,
+                        detail.mark_status
+                    ]
+                );
+            }
+
+            await client.query(
+                `
+                INSERT INTO grading_results(
+                    submission_id, total_questions, correct_count,
+                    incorrect_count, blank_count, ambiguous_count,
+                    total_score, max_score, detail
+                )
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+                `,
+                [
+                    submissionId,
+                    result.total_questions,
+                    result.correct_count,
+                    result.incorrect_count,
+                    result.blank_count,
+                    result.ambiguous_count,
+                    result.total_score,
+                    result.max_score,
+                    JSON.stringify(result.details)
+                ]
+            );
+
+            await client.query("COMMIT");
+
+        } catch (error) {
+            await client.query("ROLLBACK").catch(() => {});
+            throw error;
+
+        } finally {
+            client.release();
+        }
+
+        let duplicateCount = 0;
+
+        if (finalStudentCode) {
+            const dup = await db.query(
+                `
+                SELECT COUNT(*)::int AS n
+                FROM submissions s
+                JOIN exam_papers p ON p.id = s.paper_id
+                WHERE p.exam_id = $1 AND s.student_code = $2 AND s.id <> $3
+                `,
+                [paper.exam_id, finalStudentCode, submissionId]
+            );
+
+            duplicateCount = dup.rows[0].n;
+        }
+
+        res.status(201).json({
+            message: "Đã chấm điểm",
+            submission_id: submissionId,
+            submission_code: submissionCode,
+            student_code: finalStudentCode,
+            scanned_at: scannedAt.toISOString(),
+            scanned_at_display: stamp.display,
+            duplicate_count: duplicateCount,
+            paper: { id: paper.id, paper_code: paper.paper_code, title: paper.title },
+            detected: {
+                student_code: sbd.value,
+                student_code_status: sbd.status,
+                paper_code: maDe.value,
+                paper_code_status: maDe.status
+            },
+            grading: result
+        });
+    })
+);
+
+// Ảnh (đã vẽ vòng màu + ảnh gốc, đã nén JPEG trên máy người dùng) gửi lên SAU
+// khi đã có điểm, để việc hiện điểm không phải chờ tải ảnh.
+const uploadImagesMemory = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 6 * 1024 * 1024, files: 2 }
+});
+
+function isJpeg(buffer) {
+    return Buffer.isBuffer(buffer) && buffer.length > 3 &&
+        buffer[0] === 0xff && buffer[1] === 0xd8;
+}
+
+app.post(
+    "/api/submissions/:id/images",
+    uploadImagesMemory.fields([
+        { name: "annotated", maxCount: 1 },
+        { name: "original", maxCount: 1 }
+    ]),
+    asyncRoute(async (req, res) => {
+        const annotated = req.files && req.files.annotated && req.files.annotated[0];
+        const original = req.files && req.files.original && req.files.original[0];
+
+        if (!annotated && !original) {
+            return res.status(400).json({ error: "Chưa có ảnh nào được gửi" });
+        }
+
+        if ((annotated && !isJpeg(annotated.buffer)) || (original && !isJpeg(original.buffer))) {
+            return res.status(400).json({ error: "Ảnh phải ở định dạng JPEG" });
+        }
+
+        const result = await db.query(
+            `
+            UPDATE submissions
+            SET annotated_image_data = COALESCE($1, annotated_image_data),
+                image_data = COALESCE($2, image_data)
+            WHERE id = $3
+            RETURNING id
+            `,
+            [
+                annotated ? annotated.buffer : null,
+                original ? original.buffer : null,
+                req.params.id
+            ]
+        );
+
+        if (!result.rowCount) {
+            return res.status(404).json({ error: "Không tìm thấy bài làm" });
+        }
+
+        res.json({ ok: true });
     })
 );
 
